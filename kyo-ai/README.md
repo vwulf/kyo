@@ -608,6 +608,28 @@ An unset ceiling is the model's own maximum, sent rather than withheld, so the l
 
 A reply that stops at the ceiling with nothing to act on fails with `AIOutputLimitException`, naming the ceiling the request carried. It is not retried, because an identical request spends the whole ceiling again to stop in the same place; the levers are raising `maxTokens` toward the model's maximum, asking for less output, or choosing a model whose reasoning is budget-bounded. A reply that stopped at the ceiling but still carries a usable tool call is delivered as a partial turn instead, and the next turn starts against a fresh ceiling. On the command-harness path the ceiling bounds each of the harness's internal attempts, which it retries, so a call that keeps colliding is billed for several times the ceiling before the failure surfaces.
 
+### Result delivery
+
+A typed result normally arrives as a call to the result tool, which the request forces. Some OpenAI-compatible endpoints, typically local inference servers, enforce a forced call only loosely: their decoding constraint still admits free text before the call, and a model can write prose until the output ceiling without ever calling. Such an endpoint declares `Config.ResultDelivery.ResponseFormat`, on its provider or per entry with `resultDelivery(...)`: the result schema is then sent as a json_schema `response_format` instead, the result tool is not offered, and the reply's content is handed to the eval loop as the result tool's call, unchanged, so decoding, validation and the repair turn behave exactly as they do for a called result. Other tools are still offered, unforced; a turn that calls them carries no result. Streaming reads the result from content deltas instead of tool-call argument deltas. Only the OpenAI-compatible backend reads this declaration.
+
+```scala
+// A local llama.cpp server: its response_format constraint admits only the schema.
+val local: AI.Config =
+    AI.Config.OpenAI.default
+        .model(
+            AI.Config.OpenAI,
+            "local",
+            32768,
+            AI.Config.OutputMaximum.Unverified(4096),
+            AI.Config.ReasoningEncoding.Unavailable,
+            true,
+            false
+        )
+        .apiUrl("http://127.0.0.1:8080/v1")
+        .apiKey("unused")
+        .resultDelivery(AI.Config.ResultDelivery.ResponseFormat)
+```
+
 ### Declaring a model
 
 To use a model the catalog does not list, declare its facts with `Config.model(provider, name, contextWindow, outputMaximum, reasoning, acceptsTemperature, acceptsImages)`. To re-point an existing entry at an equivalent id, when a snapshot, fine-tune, or proxy alias shares that entry's capabilities, use `modelName(...)`.

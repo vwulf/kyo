@@ -61,6 +61,10 @@ final case class Config private (
     // disagree on both.
     systemInstructions: Config.SystemMessages,
     invalidToolCalls: Config.InvalidToolCalls,
+    // How the reply carries the result: a forced call to the result tool, or the reply's own content
+    // under a json_schema response format. Provider-level by default, overridable per entry; see
+    // Config.ResultDelivery.
+    resultDelivery: Config.ResultDelivery,
     temperature: Maybe[Double] = Absent,
     maxTokens: Maybe[Int] = Absent,
     // Carried only by the OpenAI-compatible backends; inert on Anthropic and the command harnesses.
@@ -156,6 +160,12 @@ final case class Config private (
       * needed alongside `reasoningOff` when a re-aimed config's endpoint differs on the pairing.
       */
     def forcedToolChoice(choice: Config.ForcedToolChoice): Config = copy(forcedToolChoice = choice)
+
+    /** Re-declares how this config's endpoint carries the result, needed alongside `apiUrl` when a config is
+      * re-aimed at an endpoint whose forced tool choice does not constrain the reply (see
+      * [[Config.ResultDelivery]]).
+      */
+    def resultDelivery(delivery: Config.ResultDelivery): Config = copy(resultDelivery = delivery)
 
     /** The model's output maximum as a number, verified or stood-in alike.
       *
@@ -317,7 +327,8 @@ final case class Config private (
         systemInstructions: Maybe[Config.SystemMessages] = Absent,
         invalidToolCalls: Maybe[Config.InvalidToolCalls] = Absent,
         // Declare true only after seeing this model's `stream` arrive in pieces; see `modelStreamsIncrementally`.
-        streamsIncrementally: Boolean = false
+        streamsIncrementally: Boolean = false,
+        resultDelivery: Maybe[Config.ResultDelivery] = Absent
     ): Config =
         copy(
             provider = provider,
@@ -333,7 +344,8 @@ final case class Config private (
             reasoningOff = reasoningOff.getOrElse(provider.reasoningOff),
             forcedToolChoice = forcedToolChoice.getOrElse(provider.forcedToolChoice),
             systemInstructions = systemInstructions.getOrElse(provider.systemInstructions),
-            invalidToolCalls = invalidToolCalls.getOrElse(provider.invalidToolCalls)
+            invalidToolCalls = invalidToolCalls.getOrElse(provider.invalidToolCalls),
+            resultDelivery = resultDelivery.getOrElse(provider.resultDelivery)
         )
 
     /** Re-declares which request field this config's endpoint reads the output ceiling from.
@@ -412,7 +424,8 @@ object Config:
         reasoningOff: Maybe[ReasoningOff] = Absent,
         forcedToolChoice: Maybe[ForcedToolChoice] = Absent,
         // Declare true only after seeing this model's `stream` arrive in pieces; see `modelStreamsIncrementally`.
-        streamsIncrementally: Boolean = false
+        streamsIncrementally: Boolean = false,
+        resultDelivery: Maybe[ResultDelivery] = Absent
     )(using Frame): Config < Sync =
         credentialed(catalog(
             provider,
@@ -424,7 +437,8 @@ object Config:
             acceptsImages,
             reasoningOff,
             forcedToolChoice,
-            streamsIncrementally = streamsIncrementally
+            streamsIncrementally = streamsIncrementally,
+            resultDelivery = resultDelivery
         ))
 
     /** Attaches the provider's credentials to an already-declared config, so a catalog entry's facts
@@ -464,7 +478,8 @@ object Config:
         forcedToolChoice: Maybe[ForcedToolChoice] = Absent,
         systemInstructions: Maybe[SystemMessages] = Absent,
         invalidToolCalls: Maybe[InvalidToolCalls] = Absent,
-        streamsIncrementally: Boolean = false
+        streamsIncrementally: Boolean = false,
+        resultDelivery: Maybe[ResultDelivery] = Absent
     ): Config =
         Config(
             provider.baseUrl,
@@ -483,7 +498,8 @@ object Config:
             reasoningOff.getOrElse(provider.reasoningOff),
             forcedToolChoice.getOrElse(provider.forcedToolChoice),
             systemInstructions.getOrElse(provider.systemInstructions),
-            invalidToolCalls.getOrElse(provider.invalidToolCalls)
+            invalidToolCalls.getOrElse(provider.invalidToolCalls),
+            resultDelivery.getOrElse(provider.resultDelivery)
         )
 
     /** A model's maximum output tokens, and whether that number is known or stood in for.
@@ -600,6 +616,36 @@ object Config:
         case RefusedWhileReasoning
     end ForcedToolChoice
 
+    /** How the reply carries the result, declared per provider and overridable per entry.
+      *
+      * The result is normally a call to the result tool that the request forces. A forced choice is only
+      * as strong as the endpoint makes it: one that constrains decoding admits nothing but the call, while
+      * one whose constraint still admits free text before the call lets a model write prose until the
+      * output ceiling and never call at all, so every structured generation fails at the ceiling. Measured
+      * on a local OpenAI-compatible server: a forced call on 1-5K-token prompts produced the call in 0 of
+      * 12 replies, while the same prompts with the result schema as a json_schema response format came
+      * back as schema-valid content in 30 of 30, each in a few dozen tokens, once the server was told not
+      * to emit reasoning ahead of the content (reasoning the endpoint admits before the schema spends the
+      * same ceiling).
+      *
+      * Declared because it is not derivable: the request shape is the same either way, and only the
+      * endpoint's decoding tells a forced call that holds from one that does not.
+      *
+      * Only the OpenAI-compatible backend reads it. The other backends deliver the result their own way
+      * whatever is declared here.
+      */
+    enum ResultDelivery derives CanEqual:
+        /** The result is a forced call to the result tool. */
+        case ToolCall
+
+        /** The result is the reply's content, constrained by the result schema sent as a json_schema
+          * `response_format`; the result tool is not offered. The content is handed to the eval loop as the
+          * result tool's call, verbatim, so decoding, validation and repair are unchanged. Other tools are
+          * still offered, unforced, and a turn that calls them carries no result.
+          */
+        case ResponseFormat
+    end ResultDelivery
+
     /** How many system instructions the wire delivers, declared per provider.
       *
       * A wire carrying a single system instruction does not refuse the extras: it answers 200, keeps
@@ -704,7 +750,8 @@ object Config:
         val systemInstructions: SystemMessages = SystemMessages.AllDelivered,
         val invalidToolCalls: InvalidToolCalls = InvalidToolCalls.Returned,
         val forcedToolChoice: ForcedToolChoice = ForcedToolChoice.Honored,
-        val usesApiKey: Boolean = true
+        val usesApiKey: Boolean = true,
+        val resultDelivery: ResultDelivery = ResultDelivery.ToolCall
     ):
         val orgKey: String = keyName + "_ORG"
         def default: Config

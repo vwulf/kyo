@@ -30,7 +30,16 @@ private[completion] object OpenAICompletion extends Completion:
         tools: Chunk[Tool.internal.Info[?, ?, LLM]],
         resultSchema: Maybe[JsonSchema] = Absent
     )(using Frame): Completion.Reply < (LLM & Async & Abort[HttpException | AIGenException]) =
-        fetch(config, Request(context, config, tools, resultSchema)).map(read(config, _))
+        fetch(config, Request(context, config, tools, resultSchema)).map(read(config, _, contentResultId(config, context, tools)))
+
+    /** Under [[Config.ResultDelivery.ResponseFormat]], with the result tool among `tools`, the reply's content IS the result: the id
+      * its result-tool call is recorded under. The context grows with the conversation, so its size is a per-turn unique seed, as on
+      * the streaming path. Absent when the result rides a tool call.
+      */
+    private def contentResultId(config: Config, context: Context, tools: Chunk[Tool.internal.Info[?, ?, LLM]]): Maybe[CallId] =
+        Maybe.when(config.resultDelivery == Config.ResultDelivery.ResponseFormat && tools.exists(_.name == Completion.resultToolName))(
+            CallId(s"${Completion.resultToolName}-content-${context.messages.size}")
+        )
 
     // The deactivation type this wire's activation object carries. A byte constant, never compared against,
     // only written.
@@ -110,14 +119,26 @@ private[completion] object OpenAICompletion extends Completion:
             turns = 1
         )
 
-    private def read(config: Config, response: Response)(using Frame): Completion.Reply < (LLM & Sync & Abort[AIGenException]) =
+    private def read(config: Config, response: Response, contentResult: Maybe[CallId])(using
+        Frame
+    ): Completion.Reply < (LLM & Sync & Abort[AIGenException]) =
         Maybe.fromOption(response.choices.headOption) match
             case Absent =>
                 Abort.fail(AIDecodeException("LLM response has no choices: " + Json.encode(response)))
             case Present(v) =>
-                val calls = Chunk.from(v.message.tool_calls.getOrElse(Nil).map(c =>
+                val toolCalls = Chunk.from(v.message.tool_calls.getOrElse(Nil).map(c =>
                     Call(CallId(c.id), c.function.name, c.function.arguments, c.extra_content)
                 ))
+                val content = v.message.content.getOrElse("")
+                // Where the result rides as content, a reply with no tool call and some content is the result:
+                // forwarded verbatim as the result tool's call, so the eval loop decodes, validates and repairs it
+                // exactly as a called result (non-JSON content is rejected there, not here). A reply that calls
+                // other tools carries no result, and its content stays text.
+                val (text, calls) =
+                    contentResult match
+                        case Present(id) if toolCalls.isEmpty && !content.isBlank =>
+                            ("", Chunk(Call(id, Completion.resultToolName, content)))
+                        case _ => (content, toolCalls)
                 val stop = stopReason(v.finish_reason)
                 // What a ceiling stop MEANS is not decided here: telling a usable reply apart needs the tool
                 // payload, which belongs to the tool loop. The reason rides along and the loop decides once.
@@ -131,7 +152,7 @@ private[completion] object OpenAICompletion extends Completion:
                             case _ => Kyo.unit
                     surfaced.andThen(
                         Completion.Reply(
-                            Chunk(AssistantMessage(v.message.content.getOrElse(""), calls)),
+                            Chunk(AssistantMessage(text, calls)),
                             stop,
                             usageStats(response.usage)
                         )
@@ -181,27 +202,36 @@ private[completion] object OpenAICompletion extends Completion:
         Completion.sseFragments(
             config,
             streamRequest(config, context, resultSchema, resultTool),
-            parseDeltaArguments,
+            // Under a response format the result streams as content deltas, not tool-call argument deltas.
+            if config.resultDelivery == Config.ResultDelivery.ResponseFormat then parseDeltaContent else parseDeltaArguments,
             config.maxTokens
         )
     end streamFragments
 
     private[kyo] def parseDeltaArguments(line: String)(using Frame): Result[String, Completion.Delta] =
+        parseDelta(line)(
+            _.tool_calls
+                .flatMap(tcs => Maybe.fromOption(tcs.headOption))
+                .flatMap(_.function)
+                .flatMap(_.arguments)
+        )
+
+    /** The content-delta projection, for [[Config.ResultDelivery.ResponseFormat]]: the result's JSON arrives as the reply's content. */
+    private[kyo] def parseDeltaContent(line: String)(using Frame): Result[String, Completion.Delta] =
+        parseDelta(line)(_.content)
+
+    private def parseDelta(line: String)(fragmentOf: internal.StreamDelta => Maybe[String])(using
+        Frame
+    ): Result[String, Completion.Delta] =
         import internal.*
-        // The chat-completions stream terminates with a `[DONE]` sentinel; treat it (and any content-only
-        // or empty delta) as carrying no argument fragment, so the generic projection skips it.
+        // The chat-completions stream terminates with a `[DONE]` sentinel; treat it (and any delta without
+        // a fragment of the projected field) as carrying nothing, so the generic projection skips it.
         if line.trim == "[DONE]" then Result.Success(Completion.Delta.Skip)
         else
             Json.decode[StreamChunk](line) match
                 case Result.Success(chunk) =>
                     val choice   = chunk.choices.flatMap(cs => Maybe.fromOption(cs.headOption))
-                    val fragment = choice
-                        .flatMap(_.delta)
-                        .flatMap(_.tool_calls)
-                        .flatMap(tcs => Maybe.fromOption(tcs.headOption))
-                        .flatMap(_.function)
-                        .flatMap(_.arguments)
-                        .filter(_.nonEmpty)
+                    val fragment = choice.flatMap(_.delta).flatMap(fragmentOf).filter(_.nonEmpty)
                     Result.Success(
                         fragment match
                             case Present(f) => Completion.Delta.Fragment(f)
@@ -218,7 +248,7 @@ private[completion] object OpenAICompletion extends Completion:
                     Result.Failure(s"Not a parseable OpenAI streaming chunk: $line")
             end match
         end if
-    end parseDeltaArguments
+    end parseDelta
 
     private[kyo] def streamRequest(
         config: Config,
@@ -288,7 +318,10 @@ private[completion] object OpenAICompletion extends Completion:
             // Forced unless the request activates reasoning: two endpoints behind this implementation
             // refuse a forced choice while an activation field rides, and the eval loop already carries
             // the unforced turn shape for the harnesses that cannot force at all.
-            tool_choice: String = "required",
+            // Absent only where the result rides as content and no tool is offered: an endpoint refuses a
+            // tool choice on a request without tools. Always set by `Request.apply`; the default is Absent so
+            // that an unset choice is omitted from the body rather than written as null.
+            tool_choice: Maybe[String] = Absent,
             stream: Maybe[Boolean] = Absent,
             thinking: Maybe[ThinkingToggle] = Absent,
             // The graded reasoning encoding. Carries a level word from the entry's own levels, or the
@@ -299,9 +332,13 @@ private[completion] object OpenAICompletion extends Completion:
             max_tokens: Maybe[Int] = Absent,
             // Streaming only: asks the endpoint to end the stream with a usage chunk. Without it the
             // final usage report is never sent and a streamed turn cannot state what it spent.
-            stream_options: Maybe[StreamOptions] = Absent
+            stream_options: Maybe[StreamOptions] = Absent,
+            // The result schema, where the result rides as content (Config.ResultDelivery.ResponseFormat).
+            response_format: Maybe[ResponseFormat] = Absent
         ) derives Schema
         case class StreamOptions(include_usage: Boolean) derives Schema
+        case class JsonSchemaFormat(name: String, strict: Boolean, schema: JsonSchema) derives Schema
+        case class ResponseFormat(`type`: String, json_schema: JsonSchemaFormat) derives Schema
         case class ResponseFunctionCall(arguments: String, name: String) derives Schema
         case class ResponseToolCall(
             id: String,
@@ -332,7 +369,7 @@ private[completion] object OpenAICompletion extends Completion:
         // is the incremental argument JSON fragment. Fields are Maybe to tolerate absent-in-delta members.
         case class StreamFunctionDelta(arguments: Maybe[String] = Absent) derives Schema
         case class StreamToolCallDelta(function: Maybe[StreamFunctionDelta] = Absent) derives Schema
-        case class StreamDelta(tool_calls: Maybe[List[StreamToolCallDelta]] = Absent) derives Schema
+        case class StreamDelta(tool_calls: Maybe[List[StreamToolCallDelta]] = Absent, content: Maybe[String] = Absent) derives Schema
         case class StreamChoice(delta: Maybe[StreamDelta] = Absent, finish_reason: Maybe[String] = Absent) derives Schema
         case class StreamChunk(choices: Maybe[List[StreamChoice]] = Absent, usage: Maybe[Usage] = Absent) derives Schema
 
@@ -379,11 +416,29 @@ private[completion] object OpenAICompletion extends Completion:
                     case AssistantMessage(content, calls) => !content.isBlank || calls.nonEmpty
                     case _                                => true
                 }
-                val entries  = spoken.map(toEntry).toList
-                val toolDefs =
-                    if tools.isEmpty then Absent
+                val entries = spoken.map(toEntry).toList
+                // The require-all envelope (StrictSchema.requireAll) is the result shape every backend shares,
+                // whether it rides as the result tool's parameters or as the response format.
+                def resultParams(p: Tool.internal.Info[?, ?, LLM]): JsonSchema =
+                    StrictSchema.requireAll(resultSchema.getOrElse(p.wireInputSchema))
+                // Where the result rides as content, the result tool is not offered: its schema becomes the
+                // response format instead, and only the caller's own tools remain.
+                val resultTool     = tools.find(_.name == Completion.resultToolName)
+                val asContent      = config.resultDelivery == Config.ResultDelivery.ResponseFormat && resultTool.isDefined
+                val responseFormat =
+                    if !asContent then Absent
                     else
-                        Present(tools.map { p =>
+                        // Advisory like the result tool (strict:false): an endpoint that compiles the schema into a
+                        // decoding constraint enforces it regardless, and one that does not keeps the eval loop's
+                        // repair, which a strict-mode refusal of a schema feature would not.
+                        Maybe.fromOption(resultTool).map(p =>
+                            ResponseFormat("json_schema", JsonSchemaFormat(Completion.resultToolName, false, resultParams(p)))
+                        )
+                val offered  = if asContent then tools.filterNot(_.name == Completion.resultToolName) else tools
+                val toolDefs =
+                    if offered.isEmpty then Absent
+                    else
+                        Present(offered.map { p =>
                             val params =
                                 // The result tool advertises the require-all envelope (StrictSchema.requireAll),
                                 // the ADVISORY result shape every backend shares, so the default result contract
@@ -391,8 +446,7 @@ private[completion] object OpenAICompletion extends Completion:
                                 // the one platform-forced superset. Advisory here (strict:false; the CALL is
                                 // compelled by tool_choice:"required"), so a required optional field is schema
                                 // pressure, not grammar enforcement.
-                                if p.name == Completion.resultToolName then
-                                    StrictSchema.requireAll(resultSchema.getOrElse(p.wireInputSchema))
+                                if p.name == Completion.resultToolName then resultParams(p)
                                 else p.wireInputSchema
                             ToolDef(FunctionDef(p.description, p.name, false, params))
                         }.toList)
@@ -478,13 +532,18 @@ private[completion] object OpenAICompletion extends Completion:
                     // the pair. Activation alone would give up compulsion on the wires that honor it (most of
                     // them); the wire alone would force a request the refusing wires reject. Neither implies
                     // the other, so both are asked.
+                    //
+                    // Where the result rides as content nothing is forced: the response format carries the
+                    // result, and the caller's tools, if any, are offered for the model to choose.
                     tool_choice =
-                        if activated && config.forcedToolChoice == Config.ForcedToolChoice.RefusedWhileReasoning
-                        then "auto"
-                        else "required",
+                        if asContent then toolDefs.map(_ => "auto")
+                        else if activated && config.forcedToolChoice == Config.ForcedToolChoice.RefusedWhileReasoning
+                        then Present("auto")
+                        else Present("required"),
                     thinking = thinking,
                     reasoning_effort = reasoningEffort,
-                    max_tokens = maxTokens
+                    max_tokens = maxTokens,
+                    response_format = responseFormat
                 )
             end apply
         end Request
