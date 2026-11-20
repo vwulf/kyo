@@ -239,7 +239,7 @@ class ConfigTest extends kyo.test.Test[Any]:
                 assert(entry.decider.isEmpty, s"${p.name}/${entry.modelName}: a catalog entry decides through its own completion")
             }
         }
-        assert(DeciderConfig.Provider.all.map(_.name) == Chunk("typesafe"))
+        assert(DeciderConfig.Provider.all.map(_.name) == Chunk("typesafe", "logprob"))
         DeciderConfig.Provider.all.foreach { p =>
             assert(p.entries.exists(_ eq p.default), s"${p.name}: the default is one of the listed entries")
             p.entries.foreach { entry =>
