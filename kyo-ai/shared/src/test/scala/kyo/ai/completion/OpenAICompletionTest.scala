@@ -848,4 +848,198 @@ class OpenAICompletionTest extends kyo.test.Test[Any]:
         assert(OpenAICompletion.parseDeltaArguments("not a streaming chunk").isFailure)
     }
 
+    "response format delivery" - {
+
+        def contentConfig(baseUrl: String): Config =
+            keyedConfig(baseUrl).resultDelivery(Config.ResultDelivery.ResponseFormat)
+
+        val resultSchema = Thought.internal.resultJson(Chunk.empty, Json.jsonSchema[RequireAllProbe])
+
+        def escaped(s: String): String = s.replace("\\", "\\\\").replace("\"", "\\\"")
+
+        def contentBody(content: String): String =
+            s"""{"choices":[{"message":{"role":"assistant","content":"${escaped(content)}","tool_calls":null},"finish_reason":"stop"}]}"""
+
+        "the result schema rides as a json_schema response format, and the result tool is not offered" in {
+            OpenAICompletion.streamRequest(
+                contentConfig("http://127.0.0.1:9"),
+                Context.empty.userMessage("q"),
+                resultSchema,
+                Tool.internal.resultToolDefinition.infos
+            ).map { req =>
+                assert(req.body.contains("\"response_format\":{\"type\":\"json_schema\""), s"response format: ${req.body}")
+                assert(req.body.contains(s"\"name\":\"${Completion.resultToolName}\""), s"named for the result: ${req.body}")
+                assert(req.body.contains("\"required\":[\"answer\",\"note\"]"), s"the shared require-all envelope: ${req.body}")
+                assert(!req.body.contains("\"tools\""), s"no tool is offered when only the result tool rode: ${req.body}")
+                assert(!req.body.contains("\"tool_choice\""), s"and no tool choice, which a tool-less request refuses: ${req.body}")
+            }
+        }
+
+        "the caller's tools are still offered, unforced" in {
+            val userTool = Tool.init[UserToolInputProbe]("lookup", "an optional-field tool")(_ => 1)
+            OpenAICompletion.streamRequest(
+                contentConfig("http://127.0.0.1:9"),
+                Context.empty.userMessage("q"),
+                resultSchema,
+                userTool.infos.concat(Tool.internal.resultToolDefinition.infos)
+            ).map { req =>
+                assert(req.body.contains("\"name\":\"lookup\""), s"the user tool rides: ${req.body}")
+                assert(!req.body.contains(s"\"name\":\"${Completion.resultToolName}\",\"strict\":false,\"parameters\""), req.body)
+                assert(req.body.contains("\"tool_choice\":\"auto\""), s"a user tool is offered, not forced: ${req.body}")
+                assert(req.body.contains("\"response_format\""), s"the result still rides as the response format: ${req.body}")
+            }
+        }
+
+        "the default delivery is unchanged: a forced result tool and no response format" in {
+            OpenAICompletion.streamRequest(
+                keyedConfig("http://127.0.0.1:9"),
+                Context.empty.userMessage("q"),
+                resultSchema,
+                Tool.internal.resultToolDefinition.infos
+            ).map { req =>
+                assert(keyedConfig("x").resultDelivery == Config.ResultDelivery.ToolCall)
+                assert(!req.body.contains("response_format"), s"no response format by default: ${req.body}")
+                assert(req.body.contains("\"tool_choice\":\"required\""), s"the result tool is forced: ${req.body}")
+            }
+        }
+
+        "the reply's content is handed back verbatim as the result tool's call" in {
+            TestCompletionServer.run { server =>
+                val config = contentConfig(server.baseUrl)
+                val json   = """{"resultValue":{"answer":"42","note":null}}"""
+                server.enqueueBody(contentBody(json)).andThen {
+                    LLM.run(config)(OpenAICompletion(
+                        config,
+                        Context.empty.userMessage("q"),
+                        Tool.internal.resultToolDefinition.infos,
+                        Present(resultSchema)
+                    )).map { reply =>
+                        reply.messages match
+                            case Chunk(AssistantMessage(text, calls)) =>
+                                assert(text.isEmpty, s"the content became the call, not text: '$text'")
+                                assert(calls.map(_.function) == Chunk(Completion.resultToolName), s"one result call: $calls")
+                                assert(calls.head.arguments == json, s"passed through untouched: ${calls.head.arguments}")
+                            case other => fail(s"expected one assistant message, got: $other")
+                    }
+                }
+            }
+        }
+
+        "content that is not JSON still reaches the eval loop as the result call, for it to repair" in {
+            TestCompletionServer.run { server =>
+                val config = contentConfig(server.baseUrl)
+                server.enqueueBody(contentBody("the answer is 42")).andThen {
+                    LLM.run(config)(OpenAICompletion(
+                        config,
+                        Context.empty.userMessage("q"),
+                        Tool.internal.resultToolDefinition.infos,
+                        Present(resultSchema)
+                    )).map { reply =>
+                        val calls = reply.messages.collect { case AssistantMessage(_, cs) => cs }.flatten
+                        assert(
+                            calls.map(c => (c.function, c.arguments)) == Chunk((Completion.resultToolName, "the answer is 42")),
+                            s"$calls"
+                        )
+                    }
+                }
+            }
+        }
+
+        "a reply that calls the caller's tools carries no result, and keeps its text" in {
+            TestCompletionServer.run { server =>
+                val config   = contentConfig(server.baseUrl)
+                val userTool = Tool.init[UserToolInputProbe]("lookup", "an optional-field tool")(_ => 1)
+                val body     =
+                    """{"choices":[{"message":{"role":"assistant","content":"checking","tool_calls":[{"id":"c1","type":"function",""" +
+                        """"function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}}]},"finish_reason":"tool_calls"}]}"""
+                server.enqueueBody(body).andThen {
+                    LLM.run(config)(OpenAICompletion(
+                        config,
+                        Context.empty.userMessage("q"),
+                        userTool.infos.concat(Tool.internal.resultToolDefinition.infos),
+                        Present(resultSchema)
+                    )).map { reply =>
+                        reply.messages match
+                            case Chunk(AssistantMessage(text, calls)) =>
+                                assert(text == "checking", s"text stays text: '$text'")
+                                assert(calls.map(_.function) == Chunk("lookup"), s"only the user call: $calls")
+                            case other => fail(s"expected one assistant message, got: $other")
+                    }
+                }
+            }
+        }
+
+        "gen returns the value the content carried" in {
+            TestCompletionServer.run { server =>
+                val config = contentConfig(server.baseUrl)
+                server.enqueueBody(contentBody("""{"resultValue":{"answer":"42","note":"from content"}}""")).andThen {
+                    LLM.run(config)(AI.gen[RequireAllProbe]("q")).map { result =>
+                        server.captured.map { caps =>
+                            assert(result.answer == "42" && result.note == Present("from content"), s"got: $result")
+                            assert(caps.size == 1, s"one turn, no repair: ${caps.size}")
+                            assert(caps.head.body.contains("\"response_format\""), s"sent as a response format: ${caps.head.body}")
+                        }
+                    }
+                }
+            }
+        }
+
+        "a later turn replays the earlier result as the call it was recorded as" in {
+            TestCompletionServer.run { server =>
+                val config = contentConfig(server.baseUrl)
+                server.enqueueBody(contentBody("""{"resultValue":"first"}"""))
+                    .andThen(server.enqueueBody(contentBody("""{"resultValue":"second"}""")))
+                    .andThen {
+                        LLM.run(config)(AI.initWith(ai => ai.gen[String]("one").map(a => ai.gen[String]("two").map(b => (a, b))))).map {
+                            results =>
+                                server.captured.map { caps =>
+                                    assert(results == ("first", "second"), s"got: $results")
+                                    assert(
+                                        caps(1).body.contains(s"\"name\":\"${Completion.resultToolName}\""),
+                                        s"the first result is replayed as its recorded call: ${caps(1).body}"
+                                    )
+                                }
+                        }
+                    }
+            }
+        }
+
+        "streaming: the result streams as content deltas" in {
+            def contentDelta(fragment: String): String =
+                s"""{"choices":[{"delta":{"content":"${escaped(fragment)}"}}]}"""
+            TestCompletionServer.runStreaming { server =>
+                val config = contentConfig(server.baseUrl)
+                server.enqueueStream(Chunk(
+                    contentDelta("{\"resultValue\":\"The"),
+                    contentDelta(" sky"),
+                    contentDelta(" is blue\"}")
+                )).andThen {
+                    LLM.run(config) {
+                        AI.stream[String]("What colour is the sky?").map(_.run.map { collected =>
+                            server.captured.map { caps =>
+                                assert(collected == Chunk("The", " sky", " is blue"), s"got: $collected")
+                                assert(caps.head.body.contains("\"response_format\""), s"sent as a response format: ${caps.head.body}")
+                            }
+                        })
+                    }
+                }
+            }
+        }
+
+        "streaming: parseDeltaContent projects content and ignores tool-call deltas" in {
+            def frag(line: String): Maybe[String] =
+                OpenAICompletion.parseDeltaContent(line) match
+                    case Result.Success(Completion.Delta.Fragment(f)) => Present(f)
+                    case Result.Success(_)                            => Absent
+                    case other                                        => sys.error(s"unexpected parse failure for $line: $other")
+            assert(frag("""{"choices":[{"delta":{"content":"{\"x\":1}"}}]}""") == Present("""{"x":1}"""))
+            assert(frag("""{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}""").isEmpty)
+            assert(frag("[DONE]").isEmpty)
+            assert(
+                OpenAICompletion.parseDeltaContent("""{"choices":[{"delta":{},"finish_reason":"length"}]}""") ==
+                    Result.Success(Completion.Delta.OutputLimit)
+            )
+        }
+    }
+
 end OpenAICompletionTest
