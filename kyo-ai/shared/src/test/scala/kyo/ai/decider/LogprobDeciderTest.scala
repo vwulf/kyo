@@ -24,9 +24,9 @@ object LogprobDeciderTest:
       * whose marker occurs in the request's last message (the question), with that script's first-token
       * alternatives; a request no script matches gets a 400 naming the fixture, so a test bug reads as one.
       */
-    def withServer[A](scripts: Seq[(String, String)])(f: (String, AtomicRef[Chunk[Seen]]) => A < (Async & Scope))(using
+    def withServer[A, S](scripts: Seq[(String, String)])(f: (String, AtomicRef[Chunk[Seen]]) => A < S)(using
         Frame
-    ): A < (Async & Scope & Abort[HttpBindException | HttpRouteException]) =
+    ): A < (S & Async & Scope & Abort[HttpBindException | HttpRouteException]) =
         AtomicRef.init(Chunk.empty[Seen]).map { seen =>
             val route =
                 HttpRoute.postRaw("v1/chat/completions")
