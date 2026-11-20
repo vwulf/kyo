@@ -40,7 +40,11 @@ object LogprobDeciderTest:
                             scripts.find((marker, _) => question.contains(marker)) match
                                 case Some((_, reply)) => HttpResponse.ok(reply)
                                 case None             =>
-                                    HttpResponse(HttpStatus(400)).addField("body", s"""{"error":"no script matches the question: $question"}""")
+                                    HttpResponse(HttpStatus(400)).addField(
+                                        "body",
+                                        s"""{"error":"no script matches the question: $question"}"""
+                                    )
+                            end match
                         }
                     }
             HttpServer.initWith(HttpServerConfig.default)(route) { server =>
@@ -52,7 +56,7 @@ object LogprobDeciderTest:
       * probability as a log-probability, and the given usage.
       */
     def reply(alternatives: Seq[(String, Double)], promptTokens: Int = 100, cachedTokens: Int = 0): String =
-        val tops = alternatives.map((t, p) => s"""{"token":"$t","logprob":${math.log(p)}}""").mkString(",")
+        val tops       = alternatives.map((t, p) => s"""{"token":"$t","logprob":${math.log(p)}}""").mkString(",")
         val (first, p) = alternatives.head
         s"""{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"$first"},""" +
             s""""logprobs":{"content":[{"token":"$first","logprob":${math.log(p)},"top_logprobs":[$tops]}]},"finish_reason":"length"}],""" +
@@ -154,7 +158,7 @@ class LogprobDeciderTest extends kyo.test.Test[Any]:
             val decider   = DeciderConfig.Logprob.default.apiUrl(url).modelName("served-model")
             val cfg       = config(url)
             val questions = Chunk("one?", "two?", "three?").map(q => Question.Noul(Structure.Value.Str(q), Absent, Absent, Absent))
-            LLM.run(cfg)(LogprobDecider.decide(cfg, decider, Context.empty, questions)).map { reply =>
+            LLM.run(cfg)(AI.init.map(_ => LogprobDecider.decide(cfg, decider, Context.empty, questions))).map { reply =>
                 assert(reply.answers.map {
                     case Answer.Noul(p) => p
                     case other          => -1.0
@@ -195,10 +199,13 @@ class LogprobDeciderTest extends kyo.test.Test[Any]:
     "a reply whose first token is none of the labels fails as AIDecodeException, naming the token" in {
         withServer(Seq("Is it?" -> reply(Seq("<think>" -> 0.9, "The" -> 0.1)))) { (url, _) =>
             Abort.run[AIException](LLM.run(config(url))(Decider.check("Is it?"))).map { result =>
-                assert(result.failure.exists(e =>
-                    e.isInstanceOf[AIDecodeException] && e.getMessage.contains("none of the labels Y, N") &&
-                        e.getMessage.contains("<think>")
-                ), result.toString)
+                assert(
+                    result.failure.exists(e =>
+                        e.isInstanceOf[AIDecodeException] && e.getMessage.contains("none of the labels Y, N") &&
+                            e.getMessage.contains("<think>")
+                    ),
+                    result.toString
+                )
             }
         }
     }
@@ -210,9 +217,12 @@ class LogprobDeciderTest extends kyo.test.Test[Any]:
                 result   <- Abort.run[AIException](LLM.run(config(url))(Decider.choose("Which?", options)))
                 requests <- seen.get
             yield
-                assert(result.failure.exists(e =>
-                    e.isInstanceOf[AIInvalidQuestionException] && e.getMessage.contains(s"labels at most ${LogprobDecider.maxLabels}")
-                ), result.toString)
+                assert(
+                    result.failure.exists(e =>
+                        e.isInstanceOf[AIInvalidQuestionException] && e.getMessage.contains(s"labels at most ${LogprobDecider.maxLabels}")
+                    ),
+                    result.toString
+                )
                 assert(requests.isEmpty)
             end for
         }

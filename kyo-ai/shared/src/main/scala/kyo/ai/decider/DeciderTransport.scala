@@ -43,7 +43,8 @@ private[kyo] object DeciderTransport:
                             HttpClient.postTextResponse(url, body, headers, failOnError = false).map { response =>
                                 if response.status.isSuccess then (response.fields.body: String < (Sync & Abort[AIGenException]))
                                 else
-                                    val requestId = requestIdHeader.flatMap(h => response.headers.get(h)).fold("")(id => s"[request id $id] ")
+                                    val requestId =
+                                        requestIdHeader.flatMap(h => response.headers.get(h)).fold("")(id => s"[request id $id] ")
                                     Completion.statusFailure(provider, "POST", url, response, requestId).map(Abort.fail(_))
                             }.handle(
                                 Abort.recover[HttpException](e => Abort.fail(Completion.classifyHttp(provider, e)))(_),

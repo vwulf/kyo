@@ -114,9 +114,9 @@ object DeciderConfig:
       * from `LOGPROB_DECIDER_API_KEY` when not set, and sent only when present.
       */
     case object Logprob extends Provider("logprob", "http://localhost:8000/v1", "LOGPROB_DECIDER_API_KEY", LogprobDecider):
-        val served: DeciderConfig                      = catalog(this, "default")
-        def default: DeciderConfig                     = served
-        private[kyo] val entries: Chunk[DeciderConfig] = Chunk(served)
+        val served: DeciderConfig                        = catalog(this, "default")
+        def default: DeciderConfig                       = served
+        private[kyo] val entries: Chunk[DeciderConfig]   = Chunk(served)
         override private[kyo] def selectedByKey: Boolean = false
     end Logprob
 

@@ -58,7 +58,8 @@ private[kyo] object LogprobDecider extends Decider.Backend:
                     s"kyo-ai decide backend=${decider.provider.name} model=${decider.modelName} " +
                         s"questions=${questions.size} messages=${context.messages.size}"
                 ).andThen(apiKey(decider)).map { key =>
-                    val headers = Seq("content-type" -> "application/json") ++ key.fold(Seq.empty[(String, String)])(k => Seq("Authorization" -> s"Bearer $k"))
+                    val headers = Seq("content-type" -> "application/json") ++
+                        key.fold(Seq.empty[(String, String)])(k => Seq("Authorization" -> s"Bearer $k"))
                     fanOut(config, decider, headers, conversation(context), questions)
                 }
     end decide
@@ -106,12 +107,12 @@ private[kyo] object LogprobDecider extends Decider.Backend:
       * noul's criteria (or a plain yes/no reading), a choice's option (its key, then its description when it
       * has one), a score's level.
       */
-    private[kyo] def labels(question: Question): Chunk[(String, String)] =
+    private[kyo] def labels(question: Question)(using Frame): Chunk[(String, String)] =
         question match
             case Question.Noul(_, whenTrue, whenFalse, _) =>
                 Chunk(
-                    "Y" -> whenTrue.fold("yes, it holds")(text),
-                    "N" -> whenFalse.fold("no, it does not hold")(text)
+                    "Y" -> whenTrue.fold("yes, it holds")(v => text(v)),
+                    "N" -> whenFalse.fold("no, it does not hold")(v => text(v))
                 )
             case Question.Choice(_, options) =>
                 letters.zip(options.zipWithIndex.map { case ((key, description), i) =>
@@ -127,16 +128,16 @@ private[kyo] object LogprobDecider extends Decider.Backend:
     // The keys answerOf expects, in label order: true/false, the option keys, the level indices.
     private def keys(question: Question): Chunk[String] =
         question match
-            case _: Question.Noul              => Chunk("true", "false")
-            case Question.Choice(_, options)   => options.map(_._1)
-            case Question.Score(_, levels)     => levels.zipWithIndex.map((_, i) => i.toString)
+            case _: Question.Noul            => Chunk("true", "false")
+            case Question.Choice(_, options) => options.map(_._1)
+            case Question.Score(_, levels)   => levels.zipWithIndex.map((_, i) => i.toString)
 
-    private def text(value: Structure.Value): String =
+    private def text(value: Structure.Value)(using Frame): String =
         value match
             case Structure.Value.Str(s) => s
             case other                  => Json.encode(other)
 
-    private[kyo] def prompt(question: Question): ChatMessage =
+    private[kyo] def prompt(question: Question)(using Frame): ChatMessage =
         val instructions = question match
             case Question.Noul(i, _, _, _) => i
             case Question.Choice(i, _)     => i
@@ -157,8 +158,8 @@ private[kyo] object LogprobDecider extends Decider.Backend:
     /** The conversation as role/content turns: the prefix every question of a decision shares. */
     private[kyo] def conversation(context: Context): Chunk[ChatMessage] =
         context.messages.map {
-            case SystemMessage(content)          => ChatMessage("system", content)
-            case UserMessage(content, _)         => ChatMessage("user", content)
+            case SystemMessage(content)           => ChatMessage("system", content)
+            case UserMessage(content, _)          => ChatMessage("user", content)
             case AssistantMessage(content, calls) =>
                 val called = calls.map(call => s"\n[called ${call.function} with ${call.arguments}]").mkString
                 ChatMessage("assistant", content + called)
@@ -181,7 +182,7 @@ private[kyo] object LogprobDecider extends Decider.Backend:
                         val chosen       = Chunk(TopLogprob(token.token, token.logprob))
                         val alternatives = token.top_logprobs.fold(chosen)(tops => if tops.isEmpty then chosen else tops)
                         val offered      = labels(question).map(_._1)
-                        val raw = offered.map(label =>
+                        val raw          = offered.map(label =>
                             alternatives.filter(t => reading(t.token) == label).map(t => math.exp(t.logprob)).sum
                         )
                         val sum = raw.sum
@@ -207,7 +208,7 @@ private[kyo] object LogprobDecider extends Decider.Backend:
             case Result.Panic(e)   => Result.fail(AIDecodeException(s"undecodable decider response: ${e.getMessage}"))
 
     // Wire DTOs, field names verbatim. Unknown response fields are ignored on decode.
-    private[kyo] case class ChatMessage(role: String, content: String) derives Schema
+    private[kyo] case class ChatMessage(role: String, content: String) derives Schema, CanEqual
     private[kyo] case class Request(
         model: String,
         messages: Chunk[ChatMessage],
