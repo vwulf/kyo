@@ -1,6 +1,7 @@
 package kyo.ai
 
 import kyo.*
+import kyo.ai.decider.LogprobDecider
 import kyo.ai.decider.TypeSafeDecider
 
 /** A dedicated decision provider for [[kyo.Decider]] questions: which provider, and its endpoint, key, model
@@ -77,12 +78,18 @@ object DeciderConfig:
     ):
         def default: DeciderConfig
 
+        /** Whether `Config.default` enables this provider when its key is present. A provider whose
+          * endpoint and model must be named by the caller opts out, since a key alone cannot point it
+          * anywhere useful.
+          */
+        private[kyo] def selectedByKey: Boolean = true
+
         /** Every named catalog entry, listed explicitly, so a new entry lands under the catalog-wide tests. */
         private[kyo] def entries: Chunk[DeciderConfig]
     end Provider
 
     object Provider:
-        def all: Chunk[Provider] = Chunk(TypeSafe)
+        def all: Chunk[Provider] = Chunk(TypeSafe, Logprob)
 
     /** TypeSafe AI's System One endpoint: every question kind, with calibrated probabilities. Its models
       * are the Jev family: `jevLatest` is the default, `jevPreview` the next version.
@@ -93,6 +100,25 @@ object DeciderConfig:
         def default: DeciderConfig                     = jevLatest
         private[kyo] val entries: Chunk[DeciderConfig] = Chunk(jevLatest, jevPreview)
     end TypeSafe
+
+    /** Any OpenAI-compatible chat completions endpoint that returns log-probabilities (vLLM, SGLang,
+      * llama.cpp's server, OpenAI itself): each question becomes one single-token request over the shared
+      * conversation, and the answer is read off that token's top log-probabilities. The probabilities are
+      * the served model's own token distribution over the labels, not a calibrated judge's.
+      *
+      * Built for a server that caches prompt prefixes, where a batch of questions over one conversation
+      * prefills it once: point `apiUrl` at the server's `/v1` base and name the served model with
+      * `modelName`, for example `AI.DeciderConfig.Logprob.default.apiUrl("http://localhost:8000/v1").modelName("Qwen/Qwen3-8B")`.
+      * The default entry targets vLLM's default address and leaves the model to be named, so this
+      * provider is only ever set explicitly: `Config.default` never selects it. The key is optional, read
+      * from `LOGPROB_DECIDER_API_KEY` when not set, and sent only when present.
+      */
+    case object Logprob extends Provider("logprob", "http://localhost:8000/v1", "LOGPROB_DECIDER_API_KEY", LogprobDecider):
+        val served: DeciderConfig                      = catalog(this, "default")
+        def default: DeciderConfig                     = served
+        private[kyo] val entries: Chunk[DeciderConfig] = Chunk(served)
+        override private[kyo] def selectedByKey: Boolean = false
+    end Logprob
 
     /** A pure entry: key absent, filled at use; transport settings inherited from the `Config`. */
     private[kyo] def catalog(provider: Provider, modelName: String): DeciderConfig =

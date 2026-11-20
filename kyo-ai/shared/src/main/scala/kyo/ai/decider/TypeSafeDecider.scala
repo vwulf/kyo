@@ -18,7 +18,7 @@ import kyo.ai.completion.Completion
   * do not reach the endpoint (it reads text only). Question ids are positional (`q1`, `q2`, ...); the
   * model never sees them.
   *
-  * The transport is the generation loop's: the decider's timeout (else the config's) covers the call and
+  * The transport is [[DeciderTransport]], the generation loop's discipline: the decider's timeout (else the config's) covers the call and
   * its retries, failures classify through `Completion.classifyHttp(provider.name, e)` into the module's
   * leaves, the decider's meter (else the config's) bounds concurrency, and transient leaves retry on the
   * decider's schedule (else the config's), waiting out a `Retry-After` first. A rejection carries the
@@ -90,48 +90,17 @@ private[kyo] object TypeSafeDecider extends Decider.Backend:
         Request(model, state, wire)
     end request
 
-    // One call under the generation loop's transport discipline: the deadline covers the retries, a
-    // non-2xx response is classified into the module's leaves before the retry clause sees it (with the
-    // request id ahead of the body, so a long rejection keeps it), a rate limit's Retry-After is waited
-    // out under the deadline before the schedule's own backoff, and the meter bounds concurrency. The
-    // decider's own timeout, meter and schedule apply when set, the config's otherwise.
     private def call(config: Config, decider: DeciderConfig, key: String, body: String)(using
         Frame
     ): String < (LLM & Async & Abort[AIGenException]) =
-        val provider      = decider.provider.name
-        val url           = s"${decider.apiUrl.stripSuffix("/")}/systemone"
-        val headers       = Seq("content-type" -> "application/json", "Authorization" -> s"Bearer $key")
-        val timeout       = decider.timeout.getOrElse(config.timeout)
-        val meter         = decider.meter.getOrElse(config.meter)
-        val retrySchedule = decider.retrySchedule.getOrElse(config.retrySchedule)
-        Clock.now.map(_ + timeout).map { deadline =>
-            Async.timeoutWithError[AIGenException, Result[AIGenException, String], LLM](
-                timeout,
-                Result.Failure(AICompletionTimeoutException(provider, timeout))
-            ) {
-                Abort.run[AIGenException] {
-                    HttpClient.withConfig(_.timeout(timeout)) {
-                        Abort.run[Closed] {
-                            HttpClient.postTextResponse(url, body, headers, failOnError = false).map { response =>
-                                if response.status.isSuccess then (response.fields.body: String < (Sync & Abort[AIGenException]))
-                                else
-                                    val requestId = response.headers.get(requestIdHeader).fold("")(id => s"[request id $id] ")
-                                    Completion.statusFailure(provider, "POST", url, response, requestId).map(Abort.fail(_))
-                            }.handle(
-                                Abort.recover[HttpException](e => Abort.fail(Completion.classifyHttp(provider, e)))(_),
-                                meter.run,
-                                Completion.retryWithin(deadline, retrySchedule)(_)
-                            )
-                        }.map {
-                            case Result.Success(r) => r
-                            case Result.Failure(_) => Abort.panic(AIMeterClosedException())
-                            case Result.Panic(ex)  => Abort.panic(ex)
-                        }
-                    }
-                }
-            }.map(Abort.get(_))
-        }
-    end call
+        DeciderTransport.post(
+            config,
+            decider,
+            s"${decider.apiUrl.stripSuffix("/")}/systemone",
+            Seq("content-type" -> "application/json", "Authorization" -> s"Bearer $key"),
+            body,
+            Present(requestIdHeader)
+        )
 
     private[kyo] def decode(body: String, questions: Chunk[Question])(using Frame): Result[AIGenException, Reply] =
         Json.decode[Response](body) match

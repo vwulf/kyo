@@ -16,7 +16,8 @@ import kyo.schema.doc
   * answers is a `Config` setting: by default the config's own completion provider, asked for every
   * question's probabilities by structured output in one generation, so the probabilities are the model's
   * own estimate; with a `decider` set (`AI.DeciderConfig`), TypeSafe's Jev, a model built to answer these
-  * questions with calibrated probabilities.
+  * questions with calibrated probabilities, or a self-served model whose first-token log-probabilities
+  * answer each question in its own request over a shared, cacheable prefix.
   *
   * Direct methods (`check`, `choose`, `score`) return one value. `noul`, `query` and `batch` return the full
   * answer a backend gave: a probability for a noul, a [[Decider.Decision]] for a choice, a [[Decider.Score]]
@@ -342,7 +343,8 @@ object Decider:
         end Answer
 
         /** What a backend returns: one answer per question, in order, and the spend observers have not yet
-          * seen. The TypeSafe backend reports its request's tokens as one turn; the completion backend
+          * seen. The TypeSafe backend reports its request's tokens as one turn, the Logprob backend one turn
+          * per question with the server's cached prompt tokens; the completion backend
           * reports nothing here, since its generation turns fired the observers themselves. The glue
           * forwards it to the observers on every decision, recorded or not.
           */

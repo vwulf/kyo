@@ -378,7 +378,7 @@ object Config:
       * `kyo.System`. The static `kyo.ai.provider` flag can force a provider by name. Without an explicit
       * provider, command harnesses are selected only when their marker variables are present, then API
       * providers are selected by key presence. The decider is selected the same way: the first decision
-      * provider in `DeciderConfig.Provider.all` whose key is present becomes the `decider`, so a
+      * key-selected provider in `DeciderConfig.Provider.all` whose key is present becomes the `decider`, so a
       * `TYPESAFE_API_KEY` in the environment routes decisions to Jev; without one the completion
       * provider decides.
       */
@@ -395,7 +395,7 @@ object Config:
                         probes.collectFirst { case (true, p) => p }.getOrElse(Anthropic).default
                     }
         completion.map { config =>
-            Kyo.foreach(DeciderConfig.Provider.all)(p => read(p.keyName).map(_.isDefined -> p)).map { probes =>
+            Kyo.foreach(DeciderConfig.Provider.all.filter(_.selectedByKey))(p => read(p.keyName).map(_.isDefined -> p)).map { probes =>
                 probes.collectFirst { case (true, p) => p }.fold(config)(p => config.decider(p.default))
             }.map(credentialed)
         }
