@@ -1,13 +1,25 @@
 package kyo.ai
 
 import kyo.*
+import kyo.ai.decider.LogprobDecider
 import kyo.ai.decider.TypeSafeDecider
 
 class DeciderConfigTest extends kyo.test.Test[Any]:
 
     "Provider.all lists every decision provider, each with its backend" in {
-        assert(DeciderConfig.Provider.all.map(_.name) == Chunk("typesafe"))
+        assert(DeciderConfig.Provider.all.map(_.name) == Chunk("typesafe", "logprob"))
         assert(DeciderConfig.TypeSafe.backend eq TypeSafeDecider)
+        assert(DeciderConfig.Logprob.backend eq LogprobDecider)
+    }
+
+    "the Logprob provider targets vLLM's default address, leaves the model to be named, and is never key-selected" in {
+        assert(DeciderConfig.Logprob.name == "logprob")
+        assert(DeciderConfig.Logprob.keyName == "LOGPROB_DECIDER_API_KEY")
+        assert(DeciderConfig.Logprob.baseUrl == "http://localhost:8000/v1")
+        assert(DeciderConfig.Logprob.default eq DeciderConfig.Logprob.served)
+        assert(DeciderConfig.Logprob.served.modelName == "default")
+        assert(DeciderConfig.TypeSafe.selectedByKey)
+        assert(!DeciderConfig.Logprob.selectedByKey)
     }
 
     "every provider lists its entries and its default is one of them, as stable values" in {
@@ -132,6 +144,20 @@ class DeciderConfigTest extends kyo.test.Test[Any]:
             assert(withoutKey.provider.name == "OpenAI")
             assert(withoutKey.decider.isEmpty, "no decider key, the completion provider decides")
         end for
+    }
+
+    "Config.default does not enable the Logprob decider from its key alone" in {
+        val sys = System(new TestUnsafeSystem(properties = Map("OPENAI_API_KEY" -> "k", "LOGPROB_DECIDER_API_KEY" -> "l")))
+        System.let(sys)(Config.default).map { cfg =>
+            assert(cfg.decider.isEmpty, s"decider: ${cfg.decider}")
+        }
+    }
+
+    "credentialed fills the Logprob decider's optional key when its variable is set" in {
+        val sys = System(new TestUnsafeSystem(properties = Map("LOGPROB_DECIDER_API_KEY" -> "local")))
+        System.let(sys)(Config.credentialed(Config.Anthropic.default.decider(DeciderConfig.Logprob.default))).map { cfg =>
+            assert(cfg.decider.flatMap(_.apiKey) == Present("local"))
+        }
     }
 
     private class TestUnsafeSystem(

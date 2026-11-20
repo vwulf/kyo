@@ -135,19 +135,27 @@ private[kyo] object LLMDecider:
                         val sum = raw.sum
                         if sum <= 0.0 then Result.fail(s"Answer $position gives every key a probability of 0.")
                         else
-                            val ps = raw.map(_ / sum)
-                            Result.succeed(question match
-                                case _: Question.Noul   => Answer.Noul(ps(0))
-                                case _: Question.Choice =>
-                                    val best = ps.indexOf(ps.max)
-                                    Answer.Choice(keys(best), confidence(ps), keys.zip(ps))
-                                case _: Question.Score =>
-                                    val value = ps.zipWithIndex.map((p, i) => p * i).sum
-                                    Answer.Score(value, confidence(ps), ps))
+                            Result.succeed(answerOf(question, keys, raw.map(_ / sum)))
                         end if
                 end match
         end match
     end decodeOne
+
+    /** The answer a normalized distribution over a question's keys stands for, in key order: a noul's
+      * probability of its first key (`true`), a choice's most probable key, a score's probability-weighted
+      * level index; a choice and a score carry the distribution and its confidence. Shared by the backends
+      * that read a distribution themselves.
+      */
+    private[decider] def answerOf(question: Question, keys: Chunk[String], ps: Chunk[Double]): Answer =
+        question match
+            case _: Question.Noul   => Answer.Noul(ps(0))
+            case _: Question.Choice =>
+                val best = ps.indexOf(ps.max)
+                Answer.Choice(keys(best), confidence(ps), keys.zip(ps))
+            case _: Question.Score =>
+                val value = ps.zipWithIndex.map((p, i) => p * i).sum
+                Answer.Score(value, confidence(ps), ps)
+    end answerOf
 
     // One minus the normalized entropy: 1 for a single peak, 0 for a flat distribution, 1 with one key.
     private def confidence(ps: Chunk[Double]): Double =
